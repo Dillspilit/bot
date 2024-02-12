@@ -14,9 +14,35 @@ TOKEN = config('TELEGRAM_BOT_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 filename = "attendance.xlsx"
 bonus_plan = "план продаж.xlsx"
-num_employees = 0
 individual_bonus = 0
 group_chat_id = 0
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def send_telegram_request(url, max_retries=3, backoff_factor=1):
+    session = requests.Session()
+    retries = Retry(total=max_retries,
+                    backoff_factor=backoff_factor,
+                    status_forcelist=[500, 502, 503, 504],
+                    allowed_methods=frozenset(['GET', 'POST']))
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+    try:
+        response = session.get(url)  # Используйте session.post(url, data) для POST-запроса
+        response.raise_for_status()  # Вызовет исключение для HTTP-кодов ошибок
+        return response.json()  # Возвращает JSON ответа
+    except requests.exceptions.HTTPError as http_err:
+        print(f'HTTP error occurred: {http_err}')  # Например, "404 Not Found"
+    except requests.exceptions.ConnectionError as conn_err:
+        print(f'Connection error occurred: {conn_err}')
+    except requests.exceptions.Timeout as timeout_err:
+        print(f'Timeout error occurred: {timeout_err}')
+    except requests.exceptions.RequestException as req_err:
+        print(f'Unknown error occurred: {req_err}')
 
 
 @bot.message_handler(commands=['start'], func=lambda message: message.chat.type == 'private')
@@ -62,15 +88,12 @@ bonus_data = None
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback_query(call):
     global time_str
-    global num_employees
     group_chat_id = call.message.chat.id
     message_id = call.message.message_id
     if call.data == 'confirm':
         bot.send_message(call.message.chat.id,
                          f" Привет!  @{call.from_user.username}! Хорошего рабочего дня и отличного настроения :)")
 
-        num_employees += 1
-        print(num_employees)
         write_arrival_and_bonus_to_excel(filename, call.from_user.username, time_str, bonus=0)
 
     bot.delete_message(chat_id=group_chat_id, message_id=message_id)
@@ -79,8 +102,9 @@ def handle_callback_query(call):
 @bot.message_handler(content_types=['photo'])
 def handle_photo_report(message):
 
+
     User = message.from_user.username
-    if message.caption and message.caption.startswith('#отчёт'):
+    if message.caption and message.caption.startswith('#отчёт') or message.caption.startswith('#отчет'):
         try:
             individual_bonus = 0
             group_chat_id = message.chat.id
@@ -95,16 +119,18 @@ def handle_photo_report(message):
             report_date = datetime.strptime(date_str, '%d.%m').replace(year=current_year).date()
             print(report_date)
             today = datetime.today().date()
-            bonus_value = get_bonus_from_excel(float(revenue_str))
+            bonus_value = get_bonus_from_excel(float(revenue_str), report_date)
+            num_employees = get_num_employees(report_date)
             # Проверяем, соответствует ли дата сообщения текущему дню
-            if report_date == today:
+            if report_date <= today:
                 print("bonus_value:", bonus_value)
+                print("num:",num_employees)
                 individual_bonus = int(bonus_value / num_employees) if num_employees > 0 else 0
                 print(individual_bonus)
                 # Обновляем четвертую колонку для всех соответствующих строк
 
-                write_arrival_and_bonus_to_excel(filename, username=User, arrival_time=time_str,
-                                                 bonus=individual_bonus)
+                write_arrival_and_bonus_to_excel(filename, username=User, arrival_time=None,
+                                                 bonus=individual_bonus,date=report_date)
                 print("Сохранено")
 
             report_daily_bonus(group_chat_id, individual_bonus)
@@ -114,15 +140,16 @@ def handle_photo_report(message):
         pass
 
 
-def is_weekday():
-    # Получаем текущую дату
-    today = datetime.today()
+def is_weekday(date):
+    log_time= datetime.now()
+    log_time = log_time.strftime("%d/%m/%Y %H:%M:%S")
+    print(log_time, ":", date)
 
     # Получаем номер текущего дня недели (0 - понедельник, 1 - вторник, и так далее)
-    day_of_week = today.weekday()
+    day_of_week = date.weekday()
 
     # Проверяем, является ли текущий день будним (понедельник - пятница)
-    if 0 <= day_of_week <= 4:
+    if 0 <= day_of_week <= 3:
         return 1
     else:
         return 0
@@ -152,24 +179,51 @@ def is_weekday():
 #     # Записываем данные в первую пустую строку или добавляем новую строку
 #     if empty_row:
 #         sheet.cell(row=empty_row, column=1, value=today)
-#         sheet.cell(row=empty_row, column=2, value=username)
-#         sheet.cell(row=empty_row, column=3, value=arrival_time)
-#     else:
-#         sheet.append([today, username, arrival_time])
-#
-#     workbook.save(filename)
-def write_arrival_and_bonus_to_excel(filename, username, arrival_time, bonus=None):
+#   filename = 'path_to_your_file.
+def get_num_employees(date):
+        date = date.day
+        log_time= datetime.now()
+        log_time = log_time.strftime("%d/%m/%Y %H:%M:%S")
+        print(log_time, ":", date)
+
+
+        workbook = load_workbook(filename)
+        sheet = workbook.active
+        # Находим столбец, который соответствует сегодняшнему дню
+        today_column = None
+        for col in range(1, sheet.max_column + 1):
+            if sheet.cell(row=1, column=col).value == date:
+                today_column = col
+                break
+
+        # Если столбец с сегодняшней датой найден, считаем количество сотрудников на смене
+        print(today_column)
+        num_employees = 0
+        if today_column:
+            for row in range(3, sheet.max_row + 1, 2):  # Пропускаем одну строку между записями сотрудников
+                if sheet.cell(row=row, column=today_column).value is not None:
+                    num_employees += 1
+                    print(num_employees)
+        return num_employees
+
+
+
+def write_arrival_and_bonus_to_excel(filename, username, arrival_time, bonus=None, date=None):
     if not os.path.exists(filename):
         print(f"Файл {filename} не найден.")
         return
-
     workbook = load_workbook(filename)
     sheet = workbook.active
+    if date is None:
+    	today = datetime.today()
+    	date = today.day
+    else:
+        date = date.day
+    log_time= datetime.now()
+    log_time = log_time.strftime("%d/%m/%Y %H:%M:%S")
+    print(log_time, ":", date)
 
-    today = datetime.today()
-    day = today.day
-    month = today.month
-    print(type(day), day)
+
     user_row = None
     for row in range(3, sheet.max_row + 1):
         if sheet.cell(row=row, column=1).value == username:
@@ -182,12 +236,12 @@ def write_arrival_and_bonus_to_excel(filename, username, arrival_time, bonus=Non
 
     day_col = None
     for col in range(2, sheet.max_column + 1):
-        if sheet.cell(row=1, column=col).value == day:
+        if sheet.cell(row=1, column=col).value == date:
             day_col = col
             break
 
     if day_col is None:
-        print(f"Для текущего дня {day} не найдена колонка.")
+        print(f"Для текущего дня {date} не найдена колонка.")
         return
 
     # Запись времени прибытия, если указано
@@ -202,9 +256,9 @@ def write_arrival_and_bonus_to_excel(filename, username, arrival_time, bonus=Non
 
 
 
-def get_bonus_from_excel(revenue):
+def get_bonus_from_excel(revenue, date):
     # Определяем, является ли сегодня будним или выходным
-    weekday = is_weekday()  # 1 для буднего, 0 для выходного
+    weekday = is_weekday(date)  # 1 для буднего, 0 для выходного
 
     revenue_col_idx = 1 if weekday else 4
     bonus_col_idx = 2 if weekday else 5
@@ -291,7 +345,6 @@ def download_excel_file(message):
 
 
 @bot.message_handler(commands=['add'])
-@bot.message_handler(commands=['add'])
 def handle_add(message):
     msg = bot.send_message(message.chat.id, "Введите теги сотрудников, разделенные пробелом")
     bot.register_next_step_handler(msg, process_user_tags)
@@ -324,31 +377,18 @@ def find_first_empty_row(sheet):
     for row in range(1, sheet.max_row + 1):
         if not any(cell.value for cell in sheet[row]):
             return row
-    return sheet.max_row + 1  # Если все строки содержат данные, возвращаем номер строки после последней
-
-# def process_user_tag(message):
-#     username = message.text.replace("@", "")  # Удаляем "@" из тега сотрудника
-#
-#     if not os.path.exists(filename):
-#         bot.send_message(message.chat.id, "Файл не найден.")
-#         return
-#
-#     workbook = load_workbook(filename)
-#     sheet = workbook.active
-#
-#     # Используем функцию find_first_empty_row для определения первой пустой строки
-#     max_row = find_first_empty_row(sheet)
-#
-#     # Добавляем имя пользователя и слово "Премия" на последующих строках
-#     sheet[f'A{max_row}'] = username
-#     sheet[f'A{max_row + 1}'] = "Премия"
-#
-#     workbook.save(filename)
-#     bot.send_message(message.chat.id, f"Тег сотрудника {username} и премия добавлены.")
-
+    return sheet.max_row + 1 
 
 if __name__ == "__main__":
-    bot.polling()
+    connected = False
+while not connected:
+    try:
+        bot.polling()
+        connected = True
+    except Exception as e:
+        print(f"Error: {e}")
+        print("Trying to reconnect in 10 seconds...")
+        time.sleep(10)
 
 while True:
     schedule.run_pending()
